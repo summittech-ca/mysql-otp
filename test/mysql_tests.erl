@@ -22,10 +22,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+-define(conn_state_socket_position, 4).
+
 -define(user,         "otptest").
--define(password,     "otptest").
+-define(password,     "OtpTest--123").
 -define(ssl_user,     "otptestssl").
--define(ssl_password, "otptestssl").
+-define(ssl_password, "OtpTestSSL--123").
 
 %% We need to set a the SQL mode so it is consistent across MySQL versions
 %% and distributions.
@@ -38,6 +40,7 @@
                           "  f FLOAT,"
                           "  d DOUBLE,"
                           "  dc DECIMAL(5,3),"
+                          "  ldc DECIMAL(25,3),"
                           "  y YEAR,"
                           "  ti TIME,"
                           "  ts TIMESTAMP,"
@@ -159,7 +162,8 @@ server_disconnect_test() ->
         %% Make the server close the connection after 1 second of inactivity.
         ok = mysql:query(Pid, <<"SET SESSION wait_timeout = 1">>),
         receive
-            {'EXIT', Pid, normal} -> ok
+            {'EXIT', Pid, tcp_closed} -> ok;
+            {'EXIT', Pid, ssl_closed} -> ok
         after 2000 ->
             no_exit_message
         end
@@ -167,13 +171,23 @@ server_disconnect_test() ->
     process_flag(trap_exit, false),
     ?assertExit(noproc, mysql:stop(Pid)).
 
+unexpected_message_test() ->
+    Options = [{user, ?user}, {password, ?password}],
+    {ok, Pid} = mysql:start_link(Options),
+    Sock = get_socket_from_conn(Pid),
+    {ok, [{active, once}]} = inet:getopts(Sock, [active]),
+    Pid ! {tcp, Sock, <<"Dummy\n">>},
+    {ok, [{active, once}]} = inet:getopts(Sock, [active]),
+    ok.
+
 tcp_error_test() ->
     process_flag(trap_exit, true),
     Options = [{user, ?user}, {password, ?password}],
     {ok, Pid} = mysql:start_link(Options),
+    Sock = get_socket_from_conn(Pid),
     {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
         %% Simulate a tcp error by sending a message. (Is there a better way?)
-        Pid ! {tcp_error, dummy_socket, tcp_reason},
+        Pid ! {tcp_error, Sock, tcp_reason},
         receive
             {'EXIT', Pid, {tcp_error, tcp_reason}} -> ok
         after 1000 ->
@@ -258,6 +272,45 @@ unix_socket_test() ->
     catch
         error:badarg ->
             error_logger:info_msg("Skipping unix socket tests. Current OTP "
+                                  "release could not be determined.~n")
+    end.
+
+socket_backend_test() ->
+    try
+        list_to_integer(erlang:system_info(otp_release))
+    of
+        %% Supported in OTP >= 23
+        OtpRelease when OtpRelease >= 23 ->
+            case mysql:start_link([{user, ?user},
+                                   {password, ?password},
+                                   {tcp_options, [{inet_backend, socket}]}])
+            of
+                {ok, Pid1} ->
+                    {ok, [<<"@@socket">>], [[SockFile]]} =
+                                 mysql:query(Pid1, <<"SELECT @@socket">>),
+                    mysql:stop(Pid1),
+                    case mysql:start_link([{host, {local, SockFile}},
+                                           {user, ?user}, {password, ?password},
+                                           {tcp_options, [{inet_backend, socket}]}]) of
+                        {ok, Pid2} ->
+                            ?assertEqual({ok, [<<"1">>], [[1]]},
+                                         mysql:query(Pid2, <<"SELECT 1">>)),
+                            mysql:stop(Pid2);
+                        {error, eafnotsupported} ->
+                            error_logger:info_msg("Skipping socket backend test. "
+                                                  "Not supported on this OS.~n")
+                    end;
+                {error, enotsup} ->
+                    error_logger:info_msg("Skipping socket backend test. "
+                                          "Not supported on this OS.~n")
+            end;
+        OtpRelease ->
+            error_logger:info_msg("Skipping socket backend test. Current OTP "
+                                  "release is ~B. Required release is >= 23.~n",
+                                  [OtpRelease])
+    catch
+        error:badarg ->
+            error_logger:info_msg("Skipping socket backend tests. Current OTP "
                                   "release could not be determined.~n")
     end.
 
@@ -589,8 +642,8 @@ multi_statements(Pid) ->
 
 text_protocol(Pid) ->
     ok = mysql:query(Pid, ?create_table_t),
-    ok = mysql:query(Pid, <<"INSERT INTO t (bl, f, d, dc, y, ti, ts, da, c)"
-                            " VALUES ('blob', 3.14, 3.14, 3.14, 2014,"
+    ok = mysql:query(Pid, <<"INSERT INTO t (bl, f, d, dc, ldc, y, ti, ts, da, c)"
+                            " VALUES ('blob', 3.14, 3.14, 3.14, 3.14, 2014,"
                             "'00:22:11', '2014-11-03 00:22:24', '2014-11-03',"
                             " NULL)">>),
     ?assertEqual(1, mysql:warning_count(Pid)), %% tx has no default value
@@ -600,9 +653,10 @@ text_protocol(Pid) ->
     %% select
     {ok, Columns, Rows} = mysql:query(Pid, <<"SELECT * FROM t">>),
     ?assertEqual([<<"id">>, <<"bl">>, <<"tx">>, <<"f">>, <<"d">>, <<"dc">>,
-                  <<"y">>, <<"ti">>, <<"ts">>, <<"da">>, <<"c">>], Columns),
+                  <<"ldc">>, <<"y">>, <<"ti">>, <<"ts">>, <<"da">>, <<"c">>],
+                 Columns),
     ?assertEqual([[1, <<"blob">>, <<>>, 3.14, 3.14, 3.14,
-                   2014, {0, {0, 22, 11}},
+                   <<"3.140">>, 2014, {0, {0, 22, 11}},
                    {{2014, 11, 03}, {00, 22, 24}}, {2014, 11, 03}, null]],
                  Rows),
 
@@ -611,22 +665,22 @@ text_protocol(Pid) ->
 binary_protocol(Pid) ->
     ok = mysql:query(Pid, ?create_table_t),
     %% The same queries as in the text protocol. Expect the same results.
-    {ok, Ins} = mysql:prepare(Pid, <<"INSERT INTO t (bl, tx, f, d, dc, y, ti,"
+    {ok, Ins} = mysql:prepare(Pid, <<"INSERT INTO t (bl, tx, f, d, dc, ldc, y, ti,"
                                      " ts, da, c)"
-                                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)">>),
+                                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)">>),
     %% 16#161 is the codepoint for "s with caron"; <<197, 161>> in UTF-8.
     ok = mysql:execute(Pid, Ins, [<<"blob">>, [16#161], 3.14, 3.14, 3.14,
-                                  2014, {0, {0, 22, 11}},
+                                  3.14, 2014, {0, {0, 22, 11}},
                                   {{2014, 11, 03}, {0, 22, 24}},
                                   {2014, 11, 03}, null]),
 
     {ok, Stmt} = mysql:prepare(Pid, <<"SELECT * FROM t WHERE id=?">>),
     {ok, Columns, Rows} = mysql:execute(Pid, Stmt, [1]),
     ?assertEqual([<<"id">>, <<"bl">>, <<"tx">>, <<"f">>, <<"d">>, <<"dc">>,
-                  <<"y">>, <<"ti">>,
+                  <<"ldc">>, <<"y">>, <<"ti">>,
                   <<"ts">>, <<"da">>, <<"c">>], Columns),
     ?assertEqual([[1, <<"blob">>, <<197, 161>>, 3.14, 3.14, 3.14,
-                   2014, {0, {0, 22, 11}},
+                   <<"3.140">>, 2014, {0, {0, 22, 11}},
                    {{2014, 11, 03}, {00, 22, 24}}, {2014, 11, 03}, null]],
                  Rows),
 
@@ -1203,3 +1257,6 @@ is_access_denied({1251, <<"08004">>, <<"Client does not support authentication "
     true; % This has been observed with MariaDB 10.3.13
 is_access_denied(_) ->
     false.
+
+get_socket_from_conn(Pid) ->
+    element(?conn_state_socket_position, sys:get_state(Pid)).
