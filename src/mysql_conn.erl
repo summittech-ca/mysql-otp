@@ -50,7 +50,7 @@
 -include("server_status.hrl").
 
 %% Gen_server state
--record(state, {server_version, connection_id, socket, sockmod, tcp_opts, ssl_opts,
+-record(state, {server_version, connection_id, socket = undefined, sockmod, tcp_opts, ssl_opts,
                 host, port, user, password, database, queries, prepares,
                 auth_plugin_name, auth_plugin_data, allowed_local_paths,
                 log_warnings, log_slow_queries,
@@ -58,7 +58,7 @@
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
                 stmts = dict:new(), query_cache = empty, cap_found_rows = false,
-                float_as_decimal = false, decode_decimal = auto}).
+                float_as_decimal = false, decode_decimal = auto, socket_error = <<"">>}).
 
 %% @private
 init(Opts) ->
@@ -152,8 +152,10 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
         {Pid, {ok, State3}} ->
             post_connect(State3);
         {Pid, {error, _} = E} ->
+            error_logger:warning_msg("[MYSQL:~p] Error ~p while trying to connect ~n", [Pid, E]),
             E
     after ConnectTimeout ->
+        error_logger:warning_msg("[MYSQL] Timed out while trying to connect ~n", []),
         unlink(Pid),
         exit(Pid, kill),
         {error, timeout}
@@ -161,21 +163,23 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
 
 connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
     %% Connect socket
-    SockOpts = sanitize_tcp_opts(Host, TcpOpts),
-    {ok, Socket} = gen_tcp:connect(Host, Port, SockOpts),
-
-    %% If buffer wasn't specifically defined make it at least as
-    %% large as recbuf, as suggested by the inet:setopts() docs.
-    case proplists:is_defined(buffer, TcpOpts) of
-        true ->
-            ok;
-        false ->
-            {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
-            {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
-            ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
-    end,
-
-    {ok, State#state{socket = Socket}}.
+    SockOpts = sanitize_tcp_opts(TcpOpts),
+    case gen_tcp:connect(Host, Port, SockOpts) of
+        {ok, Socket} ->
+             %% If buffer wasn't specifically defined make it at least as
+            %% large as recbuf, as suggested by the inet:setopts() docs.
+            case proplists:is_defined(buffer, TcpOpts) of
+                true ->
+                    ok;
+                false ->
+                    {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
+                    {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
+                    ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
+            end,
+            {ok, State#state{socket = Socket}};
+        {error, Reason} ->
+            {ok, State#state{socket_error = Reason}}
+    end.
 
 sanitize_tcp_opts(Host, [{inet_backend, _} = InetBackend | TcpOpts0]) ->
     %% This option is be used to turn on the experimental socket backend for
@@ -201,6 +205,11 @@ sanitize_tcp_opts(Host, TcpOpts0) ->
         false -> TcpOpts1
     end,
     [binary, {packet, raw}, {active, false} | TcpOpts2].
+
+
+handshake(#state{socket = undefined, socket_error = SocketError}) ->
+    error_logger:warning_msg("Error ~s when trying to handshare ~n", [SocketError]),
+    {error, SocketError};
 
 handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
           host = Host, user = User, password = Password, database = Database,
@@ -298,6 +307,7 @@ execute_on_connect([Query|Queries], Prepares, State) ->
 handle_call(is_connected, _, #state{socket = Socket} = State) ->
     {reply, Socket =/= undefined, State};
 handle_call(Msg, From, #state{socket = undefined} = State) ->
+    error_logger:warning_msg("[MYSQL:~p] Received signal ~p", [self(), Msg]),
     case connect(State) of
         {ok, State1} ->
             handle_call(Msg, From, State1);
